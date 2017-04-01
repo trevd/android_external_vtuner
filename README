@@ -33,12 +33,18 @@ adb shell am start -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerAct
 
 
 
-Reference - Original Code Repositories
-======================================
+Reference 
+=========
+
+Original Code Repositories
+--------------------------
 https://github.com/lecotex/vtuner
 https://github.com/lecotex/vtuner.apps
 https://github.com/lecotex/vtuner.linux-driver
 
 
+LWN Article - Initial Implementation (2011)
+-------------------------------------------
+https://lwn.net/Articles/448472/
 
 
