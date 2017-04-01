@@ -1,0 +1,1769 @@
+diff -ruN a/drivers/media/Kconfig b/drivers/media/Kconfig
+--- a/drivers/media/Kconfig	2017-04-01 10:08:13.676731878 +0100
++++ b/drivers/media/Kconfig	2017-04-01 07:44:10.155085393 +0100
+@@ -219,5 +219,6 @@
+ source "drivers/media/spi/Kconfig"
+ source "drivers/media/tuners/Kconfig"
+ source "drivers/media/dvb-frontends/Kconfig"
++source "drivers/media/vtuner/Kconfig"
+ 
+ endif # MEDIA_SUPPORT
+diff -ruN a/drivers/media/Makefile b/drivers/media/Makefile
+--- a/drivers/media/Makefile	2017-04-01 10:08:26.816804048 +0100
++++ b/drivers/media/Makefile	2017-04-01 07:43:47.639084979 +0100
+@@ -34,4 +34,5 @@
+ 
+ obj-y += common/ platform/ pci/ usb/ mmc/ firewire/ spi/
+ obj-$(CONFIG_VIDEO_DEV) += radio/
++obj-$(CONFIG_DVB_VTUNERC) += vtuner/
+ 
+diff -ruN a/drivers/media/vtuner/Kconfig b/drivers/media/vtuner/Kconfig
+--- a/drivers/media/vtuner/Kconfig	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/Kconfig	2017-04-01 07:22:59.840545188 +0100
+@@ -0,0 +1,13 @@
++config DVB_VTUNERC
++	tristate "Virtual DVB adapters support"
++	depends on DVB_CORE
++	---help---
++	  Support for virtual DVB adapter.
++
++	  Choose Y here if you want to access DVB device residing on other
++	  computers using vtuner protocol.  To compile this driver as a module,
++	  choose M here: the module will be called vtunerc.
++
++	  To connect remote DVB device, you also need to install the user space
++	  vtunerc command which can be found in the Dreamtuner package, available
++	  from http://code.google.com/p/dreamtuner/.
+diff -ruN a/drivers/media/vtuner/Makefile b/drivers/media/vtuner/Makefile
+--- a/drivers/media/vtuner/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/Makefile	2017-04-01 10:10:15.149399059 +0100
+@@ -0,0 +1,14 @@
++#
++# Makefile for the vtunerc device driver
++#
++
++VTUNERC_MAX_ADAPTERS ?= 4
++
++vtunerc-objs = vtunerc_main.o vtunerc_ctrldev.o vtunerc_proxyfe.o
++
++ccflags-y += -I$(srctree)/drivers/media/dvb-core/
++ccflags-y += -I$(srctree)/drivers/media/tuners/
++ccflags-y += -DVTUNERC_MAX_ADAPTERS=$(VTUNERC_MAX_ADAPTERS)
++
++obj-$(CONFIG_DVB_VTUNERC) += vtunerc.o
++
+diff -ruN a/drivers/media/vtuner/vtunerc_ctrldev.c b/drivers/media/vtuner/vtunerc_ctrldev.c
+--- a/drivers/media/vtuner/vtunerc_ctrldev.c	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/vtunerc_ctrldev.c	2017-04-01 07:22:59.840545188 +0100
+@@ -0,0 +1,451 @@
++/*
++ * vtunerc: /dev/vtunerc device
++ *
++ * Copyright (C) 2010-11 Honza Petrous <jpetrous@smartimp.cz>
++ * [Created 2010-03-23]
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/delay.h>
++
++#include <linux/time.h>
++#include <linux/poll.h>
++
++#include "vtunerc_priv.h"
++
++#define VTUNERC_CTRLDEV_MAJOR	266
++#define VTUNERC_CTRLDEV_NAME	"vtunerc"
++
++#define VTUNER_MSG_LEN (sizeof(struct vtuner_message))
++
++static ssize_t vtunerc_ctrldev_write(struct file *filp, const char *buff,
++					size_t len, loff_t *off)
++{
++	struct vtunerc_ctx *ctx = filp->private_data;
++	struct dvb_demux *demux = &ctx->demux;
++	int tailsize = len % 188;
++
++	if (ctx->closing)
++		return -EINTR;
++
++	if (len < 188) {
++		printk(KERN_ERR "vtunerc%d: Data are shorter then TS packet size (188B)\n",
++				ctx->idx);
++		return -EINVAL;
++	}
++
++	len -= tailsize;
++
++	// new buffer need to be allocated ?
++	if ((ctx->kernel_buf == NULL) || (len > ctx->kernel_buf_size)) {
++		// free old buffer
++		if (ctx->kernel_buf) {
++			kfree(ctx->kernel_buf);
++			ctx->kernel_buf = NULL;
++			ctx->kernel_buf_size = 0;
++		}
++		// allocate a bigger buffer
++		ctx->kernel_buf = kmalloc(len, GFP_KERNEL);
++		if (!ctx->kernel_buf) {
++			printk(KERN_ERR "vtunerc%d: unable to allocate buffer of %Zu bytes\n", ctx->idx, len);
++			return -ENOMEM;
++		}
++		ctx->kernel_buf_size = len;
++		printk(KERN_INFO "vtunerc%d: allocated buffer of %Zu bytes\n", ctx->idx, len);
++	}
++
++	if (down_interruptible(&ctx->tswrite_sem)) {
++		return -ERESTARTSYS;
++	}
++
++	if (copy_from_user(ctx->kernel_buf, buff, len)) {
++		printk(KERN_ERR "vtunerc%d: userdata passing error\n",
++				ctx->idx);
++		up(&ctx->tswrite_sem);
++		return -EINVAL;
++	}
++
++	if (ctx->config->tscheck) {
++		int i;
++
++		for (i = 0; i < len; i += 188)
++			if (ctx->kernel_buf[i] != 0x47) { /* start of TS packet */
++				printk(KERN_ERR "vtunerc%d: Data not start on packet boundary: index=%d data=%02x %02x %02x %02x %02x ...\n",
++						ctx->idx, i / 188, ctx->kernel_buf[i], ctx->kernel_buf[i + 1],
++						ctx->kernel_buf[i + 2], ctx->kernel_buf[i + 3], ctx->kernel_buf[i + 4]);
++				up(&ctx->tswrite_sem);
++				return -EINVAL;
++			}
++	}
++
++	ctx->stat_wr_data += len;
++	dvb_dmx_swfilter_packets(demux, ctx->kernel_buf, len / 188);
++
++	up(&ctx->tswrite_sem);
++
++#ifdef CONFIG_PROC_FS
++	/* TODO:  analyze injected data for statistics */
++#endif
++
++	return len;
++}
++
++static ssize_t vtunerc_ctrldev_read(struct file *filp, char __user *buff,
++		size_t len, loff_t *off)
++{
++	struct vtunerc_ctx *ctx = filp->private_data;
++
++	ctx->stat_rd_data += len;
++
++	/* read op is not using in current vtuner protocol */
++	return 0 ;
++}
++
++static int vtunerc_ctrldev_open(struct inode *inode, struct file *filp)
++{
++	struct vtunerc_ctx *ctx;
++	int minor;
++
++	minor = MINOR(inode->i_rdev);
++	ctx = filp->private_data = vtunerc_get_ctx(minor);
++	if (ctx == NULL)
++		return -ENOMEM;
++
++	ctx->stat_ctrl_sess++;
++
++	/*FIXME: clear pidtab */
++
++	ctx->fd_opened++;
++	ctx->closing = 0;
++
++	return 0;
++}
++
++static int vtunerc_ctrldev_close(struct inode *inode, struct file *filp)
++{
++	struct vtunerc_ctx *ctx = filp->private_data;
++	int minor;
++	struct vtuner_message fakemsg;
++
++	dprintk(ctx, "closing (fd_opened=%d)\n", ctx->fd_opened);
++
++	ctx->fd_opened--;
++	ctx->closing = 1;
++
++	minor = MINOR(inode->i_rdev);
++
++	/* set FAKE response, to allow finish any waiters
++	   in vtunerc_ctrldev_xchange_message() */
++	ctx->ctrldev_response.type = 0;
++	dprintk(ctx, "faked response\n");
++	wake_up_interruptible(&ctx->ctrldev_wait_response_wq);
++
++	/* clear pidtab */
++	dprintk(ctx, "sending pidtab cleared ...\n");
++	if (down_interruptible(&ctx->xchange_sem))
++		return -ERESTARTSYS;
++	memset(&fakemsg, 0, sizeof(fakemsg));
++	vtunerc_ctrldev_xchange_message(ctx, &fakemsg, 0);
++	up(&ctx->xchange_sem);
++	dprintk(ctx, "pidtab clearing done\n");
++
++	return 0;
++}
++
++static long vtunerc_ctrldev_ioctl(struct file *file, unsigned int cmd,
++					unsigned long arg)
++{
++	struct vtunerc_ctx *ctx = file->private_data;
++	int len, i, vtype, ret = 0;
++
++	if (ctx->closing)
++		return -EINTR;
++
++	if (down_interruptible(&ctx->ioctl_sem))
++		return -ERESTARTSYS;
++
++	switch (cmd) {
++	case VTUNER_SET_NAME:
++		dprintk(ctx, "msg VTUNER_SET_NAME\n");
++		len = strlen((char *)arg) + 1;
++		ctx->name = kmalloc(len, GFP_KERNEL);
++		if (ctx->name == NULL) {
++			printk(KERN_ERR "vtunerc%d: no memory\n", ctx->idx);
++			ret = -ENOMEM;
++			break;
++		}
++		if (copy_from_user(ctx->name, (char *)arg, len)) {
++			kfree(ctx->name);
++			ret = -EFAULT;
++			break;
++		}
++		break;
++
++	case VTUNER_SET_MODES:
++		dprintk(ctx, "msg VTUNER_SET_MODES\n");
++		for (i = 0; i < ctx->num_modes; i++)
++			ctx->ctypes[i] = &(((char *)(arg))[i*32]);
++		if (ctx->num_modes != 1) {
++			printk(KERN_ERR "vtunerc%d: currently supported only num_modes = 1!\n",
++					ctx->idx);
++			ret = -EINVAL;
++			break;
++		}
++		/* follow into old code for compatibility */
++
++	case VTUNER_SET_TYPE:
++		dprintk(ctx, "msg VTUNER_SET_TYPE\n");
++		if (strcasecmp((char *)arg, "DVB-S") == 0) {
++			vtype = VT_S;
++			printk(KERN_NOTICE "vtunerc%d: setting DVB-S tuner vtype\n",
++					ctx->idx);
++		} else
++		if (strcasecmp((char *)arg, "DVB-S2") == 0) {
++			vtype = VT_S2;
++			printk(KERN_NOTICE "vtunerc%d: setting DVB-S2 tuner vtype\n",
++					ctx->idx);
++		} else
++		if (strcasecmp((char *)arg, "DVB-T") == 0) {
++			vtype = VT_T;
++			printk(KERN_NOTICE "vtunerc%d: setting DVB-T tuner vtype\n",
++					ctx->idx);
++		} else
++		if (strcasecmp((char *)arg, "DVB-C") == 0) {
++			vtype = VT_C;
++			printk(KERN_NOTICE "vtunerc%d: setting DVB-C tuner vtype\n",
++					ctx->idx);
++		} else {
++			printk(KERN_ERR "vtunerc%d: unregognized tuner vtype '%s'\n",
++					ctx->idx, (char *)arg);
++			ret = -ENODEV;
++			break;
++		}
++
++		if ((vtunerc_frontend_init(ctx, vtype))) {
++			ctx->vtype = 0;
++			printk(KERN_ERR "vtunerc%d: failed to initialize tuner's internals\n",
++					ctx->idx);
++			ret = -ENODEV;
++			break;
++		}
++
++		break;
++
++
++	case VTUNER_SET_FE_INFO:
++		dprintk(ctx, "msg VTUNER_SET_FE_INFO\n");
++		len = sizeof(struct dvb_frontend_info);
++		ctx->feinfo = kmalloc(len, GFP_KERNEL);
++		if (ctx->feinfo == NULL) {
++			printk(KERN_ERR "vtunerc%d: no mem\n", ctx->idx);
++			ret = -ENOMEM;
++			break;
++		}
++		if (copy_from_user(ctx->feinfo, (char *)arg, len)) {
++			kfree(ctx->feinfo);
++			ret = -EFAULT;
++			break;
++		}
++		break;
++
++	case VTUNER_GET_MESSAGE:
++		dprintk(ctx, "msg VTUNER_GET_MESSAGE\n");
++		if (wait_event_interruptible(ctx->ctrldev_wait_request_wq,
++					ctx->ctrldev_request.type != -1)) {
++			ret = -ERESTARTSYS;
++			break;
++		}
++
++		BUG_ON(ctx->ctrldev_request.type == -1);
++
++		if (copy_to_user((char *)arg, &ctx->ctrldev_request,
++					VTUNER_MSG_LEN)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ctx->ctrldev_request.type = -1;
++
++		if (ctx->noresponse)
++			up(&ctx->xchange_sem);
++
++		break;
++
++	case VTUNER_SET_RESPONSE:
++		dprintk(ctx, "msg VTUNER_SET_RESPONSE\n");
++		if (copy_from_user(&ctx->ctrldev_response, (char *)arg,
++					VTUNER_MSG_LEN)) {
++			ret = -EFAULT;
++		}
++		wake_up_interruptible(&ctx->ctrldev_wait_response_wq);
++
++		break;
++
++	case VTUNER_SET_NUM_MODES:
++		dprintk(ctx, "msg VTUNER_SET_NUM_MODES (faked)\n");
++		ctx->num_modes = (int) arg;
++		break;
++
++	default:
++		printk(KERN_ERR "vtunerc%d: unknown IOCTL 0x%x\n", ctx->idx, cmd);
++		ret = -ENOTTY; /* Linus: the only correct one return value for unsupported ioctl */
++
++		break;
++	}
++	up(&ctx->ioctl_sem);
++
++	return ret;
++}
++
++static unsigned int vtunerc_ctrldev_poll(struct file *filp, poll_table *wait)
++{
++	struct vtunerc_ctx *ctx = filp->private_data;
++	unsigned int mask = 0;
++
++	if (ctx->closing)
++		return -EINTR;
++
++	poll_wait(filp, &ctx->ctrldev_wait_request_wq, wait);
++
++	if (ctx->ctrldev_request.type > -1) {
++		mask = POLLPRI;
++	}
++
++	return mask;
++}
++
++/* ------------------------------------------------ */
++
++static const struct file_operations vtunerc_ctrldev_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = vtunerc_ctrldev_ioctl,
++	.write = vtunerc_ctrldev_write,
++	.read  = vtunerc_ctrldev_read,
++	.poll  = (void *) vtunerc_ctrldev_poll,
++	.open  = vtunerc_ctrldev_open,
++	.release  = vtunerc_ctrldev_close
++};
++
++static struct class *pclass;
++static struct cdev cdev;
++static dev_t chdev;
++
++int vtunerc_register_ctrldev(struct vtunerc_ctx *ctx)
++{
++	int idx;
++
++	chdev = MKDEV(VTUNERC_CTRLDEV_MAJOR, 0);
++
++	if (register_chrdev_region(chdev, ctx->config->devices, VTUNERC_CTRLDEV_NAME)) {
++		printk(KERN_ERR "vtunerc%d: unable to get major %d\n",
++				ctx->idx, VTUNERC_CTRLDEV_MAJOR);
++		return -EINVAL;
++	}
++
++	cdev_init(&cdev, &vtunerc_ctrldev_fops);
++
++	cdev.owner = THIS_MODULE;
++	cdev.ops = &vtunerc_ctrldev_fops;
++
++	if (cdev_add(&cdev, chdev, ctx->config->devices) < 0)
++		printk(KERN_WARNING "vtunerc%d: unable to create dev\n",
++				ctx->idx);
++
++	pclass = class_create(THIS_MODULE, "vtuner");
++	if (IS_ERR(pclass)) {
++		printk(KERN_ERR "vtunerc%d: unable to register major %d\n",
++				ctx->idx, VTUNERC_CTRLDEV_MAJOR);
++		return PTR_ERR(pclass);
++	}
++
++	for (idx = 0; idx < ctx->config->devices; idx++) {
++		struct device *clsdev;
++
++		clsdev = device_create(pclass, NULL,
++				MKDEV(VTUNERC_CTRLDEV_MAJOR, idx),
++				/*ctx*/ NULL, "vtunerc%d", idx);
++
++		printk(KERN_NOTICE "vtunerc: registered /dev/vtunerc%d\n",
++				idx);
++	}
++
++	return 0;
++}
++
++void vtunerc_unregister_ctrldev(struct vtunerc_config *config)
++{
++	int idx;
++
++	printk(KERN_NOTICE "vtunerc: unregistering\n");
++
++	unregister_chrdev_region(chdev, config->devices);
++
++	for (idx = 0; idx < config->devices; idx++)
++		device_destroy(pclass, MKDEV(VTUNERC_CTRLDEV_MAJOR, idx));
++
++	cdev_del(&cdev);
++
++	class_destroy(pclass);
++}
++
++
++int vtunerc_ctrldev_xchange_message(struct vtunerc_ctx *ctx,
++		struct vtuner_message *msg, int wait4response)
++{
++	//dprintk(ctx, "XCH_MSG: %d: entered\n", msg->type);
++	if (down_interruptible(&ctx->xchange_sem))
++		return -ERESTARTSYS;
++
++	if (ctx->fd_opened < 1) {
++		//dprintk(ctx, "XCH_MSG: %d: no fd\n", msg->type);
++		up(&ctx->xchange_sem);
++		return 0;
++	}
++	//dprintk(ctx, "XCH_MSG: %d: continue\n", msg->type);
++
++#if 0
++	BUG_ON(ctx->ctrldev_request.type != -1);
++#else
++	if(ctx->ctrldev_request.type != -1)
++		printk(KERN_WARNING "vtunerc%d: orphan request detected, type %d\n", ctx->idx, ctx->ctrldev_request.type);
++
++#endif
++
++	memcpy(&ctx->ctrldev_request, msg, sizeof(struct vtuner_message));
++	ctx->ctrldev_response.type = -1;
++	ctx->noresponse = !wait4response;
++	wake_up_interruptible(&ctx->ctrldev_wait_request_wq);
++
++	if (!wait4response)
++		return 0;
++
++	if (wait_event_interruptible(ctx->ctrldev_wait_response_wq,
++				ctx->ctrldev_response.type != -1)) {
++		//dprintk(ctx, "XCH_MSG: %d: wait_event interrupted\n", msg->type);
++		ctx->ctrldev_request.type = -1;
++		up(&ctx->xchange_sem);
++		return -ERESTARTSYS;
++	}
++
++	BUG_ON(ctx->ctrldev_response.type == -1);
++
++	//dprintk(ctx, "XCH_MSG: %d -> %d (DONE)\n", msg->type, ctx->ctrldev_response.type);
++	memcpy(msg, &ctx->ctrldev_response, sizeof(struct vtuner_message));
++	ctx->ctrldev_response.type = -1;
++
++	up(&ctx->xchange_sem);
++
++	return 0;
++}
+diff -ruN a/drivers/media/vtuner/vtunerc_main.c b/drivers/media/vtuner/vtunerc_main.c
+--- a/drivers/media/vtuner/vtunerc_main.c	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/vtunerc_main.c	2017-04-01 07:22:59.840545188 +0100
+@@ -0,0 +1,430 @@
++/*
++ * vtunerc: Virtual adapter driver
++ *
++ * Copyright (C) 2010-12 Honza Petrous <jpetrous@smartimp.cz>
++ * [Created 2010-03-23]
++ * Sponsored by Smartimp s.r.o. for its NessieDVB.com box
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>	/* Specifically, a module */
++#include <linux/kernel.h>	/* We're doing kernel work */
++#include <linux/proc_fs.h>
++#include <linux/init.h>
++#include <linux/i2c.h>
++#include <asm/uaccess.h>
++#include <linux/delay.h>
++#include <linux/seq_file.h>
++
++#include "demux.h"
++#include "dmxdev.h"
++#include "dvb_demux.h"
++#include "dvb_frontend.h"
++#include "dvb_net.h"
++#include "dvbdev.h"
++
++#include "vtunerc_priv.h"
++
++#define VTUNERC_MODULE_VERSION "1.4"
++
++DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
++
++#define DRIVER_NAME		"vTuner proxy"
++
++#define VTUNERC_PROC_FILENAME	"vtunerc%i"
++
++#ifndef VTUNERC_MAX_ADAPTERS
++#define VTUNERC_MAX_ADAPTERS	4
++#endif
++
++static struct vtunerc_ctx *vtunerc_tbl[VTUNERC_MAX_ADAPTERS] = { NULL };
++
++/* module params */
++static struct vtunerc_config config = {
++	.devices = 1,
++	.tscheck = 0,
++	.debug = 0
++};
++
++static int pidtab_find_index(unsigned short *pidtab, int pid)
++{
++	int i = 0;
++
++	while (i < MAX_PIDTAB_LEN) {
++		if (pidtab[i] == pid)
++			return i;
++		i++;
++	}
++
++	return -1;
++}
++
++static int pidtab_add_pid(unsigned short *pidtab, int pid)
++{
++	int i;
++
++	/* TODO: speed-up hint: add pid sorted */
++
++	for (i = 0; i < MAX_PIDTAB_LEN; i++)
++		if (pidtab[i] == PID_UNKNOWN) {
++			pidtab[i] = pid;
++			return 0;
++		}
++
++	return -1;
++}
++
++static int pidtab_del_pid(unsigned short *pidtab, int pid)
++{
++	int i;
++
++	/* TODO: speed-up hint: delete sorted */
++
++	for (i = 0; i < MAX_PIDTAB_LEN; i++)
++		if (pidtab[i] == pid) {
++			pidtab[i] = PID_UNKNOWN;
++			/* TODO: move rest */
++			return 0;
++		}
++
++	return -1;
++}
++
++static void pidtab_copy_to_msg(struct vtunerc_ctx *ctx,
++				struct vtuner_message *msg)
++{
++	int i;
++
++	for (i = 0; i < (MAX_PIDTAB_LEN - 1); i++)
++		msg->body.pidlist[i] = ctx->pidtab[i]; /*TODO: optimize it*/
++	msg->body.pidlist[MAX_PIDTAB_LEN - 1] = 0;
++}
++
++static int vtunerc_start_feed(struct dvb_demux_feed *feed)
++{
++	struct dvb_demux *demux = feed->demux;
++	struct vtunerc_ctx *ctx = demux->priv;
++	struct vtuner_message msg;
++
++	switch (feed->type) {
++	case DMX_TYPE_TS:
++		break;
++	case DMX_TYPE_SEC:
++		break;
++	case DMX_TYPE_PES:
++		printk(KERN_ERR "vtunerc%d: feed type PES is not supported\n",
++				ctx->idx);
++		return -EINVAL;
++	default:
++		printk(KERN_ERR "vtunerc%d: feed type %d is not supported\n",
++				ctx->idx, feed->type);
++		return -EINVAL;
++	}
++
++	/* organize PID list table */
++
++	if (pidtab_find_index(ctx->pidtab, feed->pid) < 0) {
++		pidtab_add_pid(ctx->pidtab, feed->pid);
++
++		pidtab_copy_to_msg(ctx, &msg);
++
++		msg.type = MSG_PIDLIST;
++		vtunerc_ctrldev_xchange_message(ctx, &msg, 0);
++	}
++
++	return 0;
++}
++
++static int vtunerc_stop_feed(struct dvb_demux_feed *feed)
++{
++	struct dvb_demux *demux = feed->demux;
++	struct vtunerc_ctx *ctx = demux->priv;
++	struct vtuner_message msg;
++
++	/* organize PID list table */
++
++	if (pidtab_find_index(ctx->pidtab, feed->pid) > -1) {
++		pidtab_del_pid(ctx->pidtab, feed->pid);
++
++		pidtab_copy_to_msg(ctx, &msg);
++
++		msg.type = MSG_PIDLIST;
++		vtunerc_ctrldev_xchange_message(ctx, &msg, 0);
++	}
++
++	return 0;
++}
++
++/* ----------------------------------------------------------- */
++
++
++#ifdef CONFIG_PROC_FS
++
++static char *get_fe_name(struct dvb_frontend_info *feinfo)
++{
++	return (feinfo && feinfo->name) ? feinfo->name : "(not set)";
++}
++
++static int vtunerc_read_proc(struct seq_file *seq, void *v)
++{
++	int i, pcnt = 0;
++	struct vtunerc_ctx *ctx = (struct vtunerc_ctx *)seq->private;
++
++	seq_printf(seq, "[ vtunerc driver, version "
++				VTUNERC_MODULE_VERSION " ]\n");
++	seq_printf(seq, "  sessions: %u\n", ctx->stat_ctrl_sess);
++	seq_printf(seq, "  TS data : %u\n", ctx->stat_wr_data);
++	seq_printf(seq, "  PID tab :");
++	for (i = 0; i < MAX_PIDTAB_LEN; i++)
++		if (ctx->pidtab[i] != PID_UNKNOWN) {
++			seq_printf(seq, " %x", ctx->pidtab[i]);
++			pcnt++;
++		}
++	seq_printf(seq, " (len=%d)\n", pcnt);
++	seq_printf(seq, "  FE type : %s\n", get_fe_name(ctx->feinfo));
++
++	seq_printf(seq, "  msg xchg: %d/%d\n", ctx->ctrldev_request.type, ctx->ctrldev_response.type);
++
++	return 0;
++}
++
++static int vtunerc_proc_open(struct inode *inode, struct file *file)
++{
++	int ret;
++	struct vtunerc_ctx *ctx = PDE_DATA(inode);
++
++	if (!try_module_get(THIS_MODULE))
++		return -ENODEV;
++	ret = single_open(file, vtunerc_read_proc, ctx);
++	if (ret)
++		module_put(THIS_MODULE);
++	return ret;
++}
++
++static int vtuner_proc_release(struct inode *inode, struct file *file)
++{
++	int ret = single_release(inode, file);
++	module_put(THIS_MODULE);
++	return ret;
++}
++
++static const struct file_operations vtunerc_read_proc_fops = {
++	.open		= vtunerc_proc_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= vtuner_proc_release,
++	};
++
++#endif
++
++static char *my_strdup(const char *s)
++{
++	char *rv = kmalloc(strlen(s)+1, GFP_KERNEL);
++	if (rv)
++		strcpy(rv, s);
++	return rv;
++}
++
++struct vtunerc_ctx *vtunerc_get_ctx(int minor)
++{
++	if (minor >= VTUNERC_MAX_ADAPTERS)
++		return NULL;
++
++	return vtunerc_tbl[minor];
++}
++
++static int __init vtunerc_init(void)
++{
++	struct vtunerc_ctx *ctx = NULL;
++	struct dvb_demux *dvbdemux;
++	struct dmx_demux *dmx;
++	int ret = -EINVAL, i, idx;
++
++	printk(KERN_INFO "virtual DVB adapter driver, version "
++			VTUNERC_MODULE_VERSION
++			", (c) 2010-12 Honza Petrous, SmartImp.cz\n");
++
++	request_module("dvb-core"); /* FIXME: dunno which way it should work :-/ */
++
++	for (idx = 0; idx < config.devices; idx++) {
++		ctx = kzalloc(sizeof(struct vtunerc_ctx), GFP_KERNEL);
++		if (!ctx) {
++			while(idx)
++				kfree(vtunerc_tbl[--idx]);
++			return -ENOMEM;
++		}
++
++		vtunerc_tbl[idx] = ctx;
++
++		ctx->idx = idx;
++		ctx->config = &config;
++		ctx->ctrldev_request.type = -1;
++		ctx->ctrldev_response.type = -1;
++		init_waitqueue_head(&ctx->ctrldev_wait_request_wq);
++		init_waitqueue_head(&ctx->ctrldev_wait_response_wq);
++
++		// buffer
++		ctx->kernel_buf = NULL;
++		ctx->kernel_buf_size = 0;
++
++		/* dvb */
++
++		/* create new adapter */
++		ret = dvb_register_adapter(&ctx->dvb_adapter, DRIVER_NAME,
++					   THIS_MODULE, NULL, adapter_nr);
++		if (ret < 0)
++			goto err_kfree;
++
++		ctx->dvb_adapter.priv = ctx;
++
++		memset(&ctx->demux, 0, sizeof(ctx->demux));
++		dvbdemux = &ctx->demux;
++		dvbdemux->priv = ctx;
++		dvbdemux->filternum = MAX_PIDTAB_LEN;
++		dvbdemux->feednum = MAX_PIDTAB_LEN;
++		dvbdemux->start_feed = vtunerc_start_feed;
++		dvbdemux->stop_feed = vtunerc_stop_feed;
++		dvbdemux->dmx.capabilities = 0;
++		ret = dvb_dmx_init(dvbdemux);
++		if (ret < 0)
++			goto err_dvb_unregister_adapter;
++
++		dmx = &dvbdemux->dmx;
++
++		ctx->hw_frontend.source = DMX_FRONTEND_0;
++		ctx->mem_frontend.source = DMX_MEMORY_FE;
++		ctx->dmxdev.filternum = MAX_PIDTAB_LEN;
++		ctx->dmxdev.demux = dmx;
++
++		ret = dvb_dmxdev_init(&ctx->dmxdev, &ctx->dvb_adapter);
++		if (ret < 0)
++			goto err_dvb_dmx_release;
++
++		ret = dmx->add_frontend(dmx, &ctx->hw_frontend);
++		if (ret < 0)
++			goto err_dvb_dmxdev_release;
++
++		ret = dmx->add_frontend(dmx, &ctx->mem_frontend);
++		if (ret < 0)
++			goto err_remove_hw_frontend;
++
++		ret = dmx->connect_frontend(dmx, &ctx->hw_frontend);
++		if (ret < 0)
++			goto err_remove_mem_frontend;
++
++		sema_init(&ctx->xchange_sem, 1);
++		sema_init(&ctx->ioctl_sem, 1);
++		sema_init(&ctx->tswrite_sem, 1);
++
++		/* init pid table */
++		for (i = 0; i < MAX_PIDTAB_LEN; i++)
++			ctx->pidtab[i] = PID_UNKNOWN;
++
++#ifdef CONFIG_PROC_FS
++		{
++			char procfilename[64];
++
++			sprintf(procfilename, VTUNERC_PROC_FILENAME,
++					ctx->idx);
++			ctx->procname = my_strdup(procfilename);
++			if (proc_create_data(ctx->procname, 0, NULL,
++							&vtunerc_read_proc_fops,
++							ctx) == 0)
++				printk(KERN_WARNING
++					"vtunerc%d: Unable to register '%s' proc file\n",
++					ctx->idx, ctx->procname);
++		}
++#endif
++	}
++
++	vtunerc_register_ctrldev(ctx);
++
++out:
++	return ret;
++
++	dmx->disconnect_frontend(dmx);
++err_remove_mem_frontend:
++	dmx->remove_frontend(dmx, &ctx->mem_frontend);
++err_remove_hw_frontend:
++	dmx->remove_frontend(dmx, &ctx->hw_frontend);
++err_dvb_dmxdev_release:
++	dvb_dmxdev_release(&ctx->dmxdev);
++err_dvb_dmx_release:
++	dvb_dmx_release(dvbdemux);
++err_dvb_unregister_adapter:
++	dvb_unregister_adapter(&ctx->dvb_adapter);
++err_kfree:
++	kfree(ctx);
++	goto out;
++}
++
++static void __exit vtunerc_exit(void)
++{
++	struct dvb_demux *dvbdemux;
++	struct dmx_demux *dmx;
++	int idx;
++
++	vtunerc_unregister_ctrldev(&config);
++
++	for (idx = 0; idx < config.devices; idx++) {
++		struct vtunerc_ctx *ctx = vtunerc_tbl[idx];
++		if(!ctx)
++			continue;
++		vtunerc_tbl[idx] = NULL;
++#ifdef CONFIG_PROC_FS
++		remove_proc_entry(ctx->procname, NULL);
++		kfree(ctx->procname);
++#endif
++
++		vtunerc_frontend_clear(ctx);
++
++		dvbdemux = &ctx->demux;
++		dmx = &dvbdemux->dmx;
++
++		dmx->disconnect_frontend(dmx);
++		dmx->remove_frontend(dmx, &ctx->mem_frontend);
++		dmx->remove_frontend(dmx, &ctx->hw_frontend);
++		dvb_dmxdev_release(&ctx->dmxdev);
++		dvb_dmx_release(dvbdemux);
++		dvb_unregister_adapter(&ctx->dvb_adapter);
++
++		// free allocated buffer
++		if(ctx->kernel_buf != NULL) {
++			kfree(ctx->kernel_buf);
++			printk(KERN_INFO "vtunerc%d: deallocated buffer of %Zu bytes\n", idx, ctx->kernel_buf_size);
++			ctx->kernel_buf = NULL;
++			ctx->kernel_buf_size = 0;
++
++		}
++
++		kfree(ctx);
++	}
++
++	printk(KERN_NOTICE "vtunerc: unloaded successfully\n");
++}
++
++module_init(vtunerc_init);
++module_exit(vtunerc_exit);
++
++MODULE_AUTHOR("Honza Petrous");
++MODULE_DESCRIPTION("virtual DVB device");
++MODULE_LICENSE("GPL");
++MODULE_VERSION(VTUNERC_MODULE_VERSION);
++
++module_param_named(devices, config.devices, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++MODULE_PARM_DESC(devices, "Number of virtual adapters (default is 1)");
++
++module_param_named(tscheck, config.tscheck, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++MODULE_PARM_DESC(tscheck, "Check TS packet validity (default is 0)");
++
++module_param_named(debug, config.debug, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++MODULE_PARM_DESC(debug, "Enable debug messages (default is 0)");
++
+diff -ruN a/drivers/media/vtuner/vtunerc_priv.h b/drivers/media/vtuner/vtunerc_priv.h
+--- a/drivers/media/vtuner/vtunerc_priv.h	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/vtunerc_priv.h	2017-04-01 07:22:59.840545188 +0100
+@@ -0,0 +1,121 @@
++/*
++ * vtunerc: Internal defines
++ *
++ * Copyright (C) 2010-11 Honza Petrous <jpetrous@smartimp.cz>
++ * [Created 2010-03-23]
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef _VTUNERC_PRIV_H
++#define _VTUNERC_PRIV_H
++
++#include <linux/module.h>	/* Specifically, a module */
++#include <linux/kernel.h>	/* We're doing kernel work */
++#include <linux/cdev.h>
++#include <linux/version.h>
++
++#include "demux.h"
++#include "dmxdev.h"
++#include "dvb_demux.h"
++#include "dvb_frontend.h"
++#include "dvb_net.h"
++#include "dvbdev.h"
++
++#include "vtuner.h"
++
++#define MAX_PIDTAB_LEN 30
++
++#define PID_UNKNOWN 0x0FFFF
++
++#define MAX_NUM_VTUNER_MODES 3
++
++struct vtunerc_config {
++
++	int debug;
++	int tscheck;
++	int devices;
++};
++
++struct vtunerc_ctx {
++
++	/* DVB api */
++	struct dmx_frontend hw_frontend;
++	struct dmx_frontend mem_frontend;
++	struct dmxdev dmxdev;
++	struct dmxdev dmxdev1;
++	struct dmxdev dmxdev2;
++	struct dvb_adapter dvb_adapter;
++	struct dvb_demux demux;
++	struct dvb_frontend *fe;
++	struct dvb_net dvbnet;
++	struct dvb_device *ca;
++
++	/* internals */
++	int idx;
++	char *name;
++	u8 vtype;
++	struct dvb_frontend_info *feinfo;
++	struct vtunerc_config *config;
++
++	unsigned short pidtab[MAX_PIDTAB_LEN];
++
++	struct semaphore xchange_sem;
++	struct semaphore ioctl_sem;
++	struct semaphore tswrite_sem;
++	int fd_opened;
++	int closing;
++
++	char *procname;
++
++	char *kernel_buf;
++	ssize_t kernel_buf_size;
++
++	/* ctrldev */
++	char trail[188];
++	unsigned int trailsize;
++	int noresponse;
++	int num_modes;
++	char *ctypes[MAX_NUM_VTUNER_MODES];
++	struct vtuner_message ctrldev_request;
++	struct vtuner_message ctrldev_response;
++	wait_queue_head_t ctrldev_wait_request_wq;
++	wait_queue_head_t ctrldev_wait_response_wq;
++
++	/* proc statistics */
++	unsigned int stat_wr_data;
++	unsigned int stat_rd_data;
++	unsigned int stat_ctrl_sess;
++	unsigned short pidstat[MAX_PIDTAB_LEN];
++};
++
++int vtunerc_register_ctrldev(struct vtunerc_ctx *ctx);
++void vtunerc_unregister_ctrldev(struct vtunerc_config *config);
++struct vtunerc_ctx *vtunerc_get_ctx(int minor);
++int /*__devinit*/ vtunerc_frontend_init(struct vtunerc_ctx *ctx, int vtype);
++int /*__devinit*/ vtunerc_frontend_clear(struct vtunerc_ctx *ctx);
++int vtunerc_ctrldev_xchange_message(struct vtunerc_ctx *ctx,
++					struct vtuner_message *msg,
++					int wait4response);
++#define dprintk(ctx, fmt, arg...) do {					\
++if (ctx->config && (ctx->config->debug))				\
++	printk(KERN_DEBUG "vtunerc%d: " fmt, ctx->idx, ##arg);	\
++} while (0)
++
++/* backward compatibility stuff */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
++static inline void *PDE_DATA(const struct inode *inode)
++{
++	return PROC_I(inode)->pde->data;
++}
++#endif
++
++
++#endif
+diff -ruN a/drivers/media/vtuner/vtunerc_proxyfe.c b/drivers/media/vtuner/vtunerc_proxyfe.c
+--- a/drivers/media/vtuner/vtunerc_proxyfe.c	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/vtunerc_proxyfe.c	2017-04-01 07:25:30.137370683 +0100
+@@ -0,0 +1,579 @@
++/*
++ * vtunerc: Driver for Proxy Frontend
++ *
++ * Copyright (C) 2010-12 Honza Petrous <jpetrous@smartimp.cz>
++ * [Inspired on proxy frontend by Emard <emard@softhome.net>]
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++
++#include "dvb_frontend.h"
++
++#include "vtunerc_priv.h"
++
++#if (DVB_API_VERSION << 8 | DVB_API_VERSION_MINOR) < 0x0505
++#error ========================================================================
++#error Version 5.5 or newer of DVB API is required (see at linux/dvb/version.h)
++#error You can find it in kernel version >= 3.3.0
++#error ========================================================================
++#endif
++
++struct dvb_proxyfe_state {
++	struct dvb_frontend frontend;
++	struct vtunerc_ctx *ctx;
++};
++
++
++static int dvb_proxyfe_read_status(struct dvb_frontend *fe, enum fe_status *status)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_READ_STATUS;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	*status = msg.body.status;
++
++	return 0;
++}
++
++static int dvb_proxyfe_read_ber(struct dvb_frontend *fe, u32 *ber)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_READ_BER;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	*ber = msg.body.ber;
++
++	return 0;
++}
++
++static int dvb_proxyfe_read_signal_strength(struct dvb_frontend *fe,
++						u16 *strength)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_READ_SIGNAL_STRENGTH;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	*strength = msg.body.ss;
++
++	return 0;
++}
++
++static int dvb_proxyfe_read_snr(struct dvb_frontend *fe, u16 *snr)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_READ_SNR;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	*snr = msg.body.snr;
++
++	return 0;
++}
++
++static int dvb_proxyfe_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_READ_UCBLOCKS;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	*ucblocks = msg.body.ucb;
++
++	return 0;
++}
++
++static int dvb_proxyfe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_properties *c)
++{
++	//struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.type = MSG_GET_FRONTEND;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	switch (ctx->vtype) {
++	case VT_S:
++	case VT_S2:
++		/*FIXME*/
++		{
++			c->symbol_rate = msg.body.fe_params.u.qpsk.symbol_rate;
++			c->fec_inner = msg.body.fe_params.u.qpsk.fec_inner;
++		}
++		break;
++	case VT_T:
++		{
++			c->bandwidth_hz = msg.body.fe_params.u.ofdm.bandwidth;
++			c->code_rate_HP = msg.body.fe_params.u.ofdm.code_rate_HP;
++			c->code_rate_LP = msg.body.fe_params.u.ofdm.code_rate_LP;
++			c->modulation = msg.body.fe_params.u.ofdm.constellation;
++			c->transmission_mode = msg.body.fe_params.u.ofdm.transmission_mode;
++			c->guard_interval = msg.body.fe_params.u.ofdm.guard_interval;
++			c->hierarchy = msg.body.fe_params.u.ofdm.hierarchy_information;
++		}
++		break;
++	case VT_C:
++		/* FIXME: untested */
++		{
++			c->symbol_rate = msg.body.fe_params.u.qam.symbol_rate;
++			c->fec_inner = msg.body.fe_params.u.qam.fec_inner;
++			c->modulation = msg.body.fe_params.u.qam.modulation;
++		}
++		break;
++	default:
++		printk(KERN_ERR "vtunerc%d: unregognized tuner vtype = %d\n", ctx->idx,
++				ctx->vtype);
++		return -EINVAL;
++	}
++	c->frequency = msg.body.fe_params.frequency;
++	c->inversion = msg.body.fe_params.inversion;
++	return 0;
++}
++
++static int dvb_proxyfe_set_frontend(struct dvb_frontend *fe)
++{
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	memset(&msg, 0, sizeof(msg));
++	msg.body.fe_params.frequency = c->frequency;
++	msg.body.fe_params.inversion = c->inversion;
++
++	switch (ctx->vtype) {
++	case VT_S:
++	case VT_S2:
++		msg.body.fe_params.u.qpsk.symbol_rate = c->symbol_rate;
++		msg.body.fe_params.u.qpsk.fec_inner = c->fec_inner;
++
++		if (ctx->vtype == VT_S2 && c->delivery_system == SYS_DVBS2) {
++			/* DELIVERY SYSTEM: S2 delsys in use */
++			msg.body.fe_params.u.qpsk.fec_inner = 9;
++
++			/* MODULATION */
++			if (c->modulation == PSK_8)
++				/* signal PSK_8 modulation used */
++				msg.body.fe_params.u.qpsk.fec_inner += 9;
++
++			/* FEC */
++			switch (c->fec_inner) {
++			case FEC_1_2:
++				msg.body.fe_params.u.qpsk.fec_inner += 1;
++				break;
++			case FEC_2_3:
++				msg.body.fe_params.u.qpsk.fec_inner += 2;
++				break;
++			case FEC_3_4:
++				msg.body.fe_params.u.qpsk.fec_inner += 3;
++				break;
++			case FEC_4_5:
++				msg.body.fe_params.u.qpsk.fec_inner += 8;
++				break;
++			case FEC_5_6:
++				msg.body.fe_params.u.qpsk.fec_inner += 4;
++				break;
++			/*case FEC_6_7: // undefined
++				msg.body.fe_params.u.qpsk.fec_inner += 2;
++				break;*/
++			case FEC_7_8:
++				msg.body.fe_params.u.qpsk.fec_inner += 5;
++				break;
++			case FEC_8_9:
++				msg.body.fe_params.u.qpsk.fec_inner += 6;
++				break;
++			/*case FEC_AUTO: // undefined
++				msg.body.fe_params.u.qpsk.fec_inner += 2;
++				break;*/
++			case FEC_3_5:
++				msg.body.fe_params.u.qpsk.fec_inner += 7;
++				break;
++			case FEC_9_10:
++				msg.body.fe_params.u.qpsk.fec_inner += 9;
++				break;
++			default:
++				; /*FIXME: what now? */
++				break;
++			}
++
++			/* ROLLOFF */
++			switch (c->rolloff) {
++			case ROLLOFF_20:
++				msg.body.fe_params.inversion |= 0x08;
++				break;
++			case ROLLOFF_25:
++				msg.body.fe_params.inversion |= 0x04;
++				break;
++			case ROLLOFF_35:
++			default:
++				break;
++			}
++
++			/* PILOT */
++			switch (c->pilot) {
++			case PILOT_ON:
++				msg.body.fe_params.inversion |= 0x10;
++				break;
++			case PILOT_AUTO:
++				msg.body.fe_params.inversion |= 0x20;
++				break;
++			case PILOT_OFF:
++			default:
++				break;
++			}
++		}
++		break;
++	case VT_T:
++		msg.body.fe_params.u.ofdm.bandwidth = c->bandwidth_hz;
++		msg.body.fe_params.u.ofdm.code_rate_HP = c->code_rate_HP;
++		msg.body.fe_params.u.ofdm.code_rate_LP = c->code_rate_LP;
++		msg.body.fe_params.u.ofdm.constellation = c->modulation;
++		msg.body.fe_params.u.ofdm.transmission_mode = c->transmission_mode;
++		msg.body.fe_params.u.ofdm.guard_interval = c->guard_interval;
++		msg.body.fe_params.u.ofdm.hierarchy_information = c->hierarchy;
++		break;
++	case VT_C:
++		msg.body.fe_params.u.qam.symbol_rate = c->symbol_rate;
++		msg.body.fe_params.u.qam.fec_inner = c->fec_inner;
++		msg.body.fe_params.u.qam.modulation = c->modulation;
++		break;
++	default:
++		printk(KERN_ERR "vtunerc%d: unregognized tuner vtype = %d\n",
++				ctx->idx, ctx->vtype);
++		return -EINVAL;
++	}
++
++	msg.type = MSG_SET_FRONTEND;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	return 0;
++}
++
++static int dvb_proxyfe_get_property(struct dvb_frontend *fe, struct dtv_property* tvp)
++{
++	return 0;
++}
++
++static enum dvbfe_algo dvb_proxyfe_get_frontend_algo(struct dvb_frontend *fe)
++{
++	return DVBFE_ALGO_SW;
++}
++
++static int dvb_proxyfe_sleep(struct dvb_frontend *fe)
++{
++	return 0;
++}
++
++static int dvb_proxyfe_init(struct dvb_frontend *fe)
++{
++	return 0;
++}
++
++static int dvb_proxyfe_set_tone(struct dvb_frontend *fe, enum fe_sec_tone_mode tone)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.body.tone = tone;
++	msg.type = MSG_SET_TONE;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	return 0;
++}
++
++static int dvb_proxyfe_set_voltage(struct dvb_frontend *fe, enum fe_sec_voltage voltage)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.body.voltage = voltage;
++	msg.type = MSG_SET_VOLTAGE;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	return 0;
++}
++
++static int dvb_proxyfe_send_diseqc_msg(struct dvb_frontend *fe, struct dvb_diseqc_master_cmd *cmd)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	memcpy(&msg.body.diseqc_master_cmd, cmd, sizeof(struct dvb_diseqc_master_cmd));
++	msg.type = MSG_SEND_DISEQC_MSG;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	return 0;
++}
++
++static int dvb_proxyfe_send_diseqc_burst(struct dvb_frontend *fe, enum fe_sec_mini_cmd burst)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++	struct vtunerc_ctx *ctx = state->ctx;
++	struct vtuner_message msg;
++
++	msg.body.burst = burst;
++	msg.type = MSG_SEND_DISEQC_BURST;
++	vtunerc_ctrldev_xchange_message(ctx, &msg, 1);
++
++	return 0;
++}
++
++static void dvb_proxyfe_release(struct dvb_frontend *fe)
++{
++	struct dvb_proxyfe_state *state = fe->demodulator_priv;
++
++	kfree(state);
++}
++
++static struct dvb_frontend_ops dvb_proxyfe_ofdm_ops;
++
++static struct dvb_frontend *dvb_proxyfe_ofdm_attach(struct vtunerc_ctx *ctx)
++{
++	struct dvb_frontend *fe = ctx->fe;
++
++	if (!fe) {
++		struct dvb_proxyfe_state *state = NULL;
++
++		/* allocate memory for the internal state */
++		state = kmalloc(sizeof(struct dvb_proxyfe_state), GFP_KERNEL);
++		if (state == NULL) {
++			return NULL;
++		}
++
++		fe = &state->frontend;
++		fe->demodulator_priv = state;
++		state->ctx = ctx;
++	}
++
++	memcpy(&fe->ops, &dvb_proxyfe_ofdm_ops, sizeof(struct dvb_frontend_ops));
++
++	return fe;
++}
++
++static struct dvb_frontend_ops dvb_proxyfe_qpsk_ops;
++
++static struct dvb_frontend *dvb_proxyfe_qpsk_attach(struct vtunerc_ctx *ctx, int can_2g_modulation)
++{
++	struct dvb_frontend *fe = ctx->fe;
++
++	if (!fe) {
++		struct dvb_proxyfe_state *state = NULL;
++
++		/* allocate memory for the internal state */
++		state = kmalloc(sizeof(struct dvb_proxyfe_state), GFP_KERNEL);
++		if (state == NULL) {
++			return NULL;
++		}
++
++		fe = &state->frontend;
++		fe->demodulator_priv = state;
++		state->ctx = ctx;
++	}
++
++	memcpy(&fe->ops, &dvb_proxyfe_qpsk_ops, sizeof(struct dvb_frontend_ops));
++	if (can_2g_modulation) {
++		fe->ops.info.caps |= FE_CAN_2G_MODULATION;
++		fe->ops.delsys[1] = SYS_DVBS2;
++		strcpy(fe->ops.info.name, "vTuner proxyFE DVB-S2");
++	}
++
++	return fe;
++}
++
++static struct dvb_frontend_ops dvb_proxyfe_qam_ops;
++
++static struct dvb_frontend *dvb_proxyfe_qam_attach(struct vtunerc_ctx *ctx)
++{
++	struct dvb_frontend *fe = ctx->fe;
++
++	if (!fe) {
++		struct dvb_proxyfe_state *state = NULL;
++
++		/* allocate memory for the internal state */
++		state = kmalloc(sizeof(struct dvb_proxyfe_state), GFP_KERNEL);
++		if (state == NULL) {
++			return NULL;
++		}
++
++		fe = &state->frontend;
++		fe->demodulator_priv = state;
++		state->ctx = ctx;
++	}
++
++	memcpy(&fe->ops, &dvb_proxyfe_qam_ops, sizeof(struct dvb_frontend_ops));
++
++	return fe;
++}
++
++static struct dvb_frontend_ops dvb_proxyfe_ofdm_ops = {
++	.delsys = { SYS_DVBT },
++	.info = {
++		.name			= "vTuner proxyFE DVB-T",
++		.type			= FE_OFDM,
++		.frequency_min		= 51000000,
++		.frequency_max		= 863250000,
++		.frequency_stepsize	= 62500,
++		.caps = FE_CAN_FEC_1_2 | FE_CAN_FEC_2_3 | FE_CAN_FEC_3_4 |
++				FE_CAN_FEC_4_5 | FE_CAN_FEC_5_6 | FE_CAN_FEC_6_7 |
++				FE_CAN_FEC_7_8 | FE_CAN_FEC_8_9 | FE_CAN_FEC_AUTO |
++				FE_CAN_QAM_16 | FE_CAN_QAM_64 | FE_CAN_QAM_AUTO |
++				FE_CAN_TRANSMISSION_MODE_AUTO |
++				FE_CAN_GUARD_INTERVAL_AUTO |
++				FE_CAN_HIERARCHY_AUTO,
++	},
++
++	.release = dvb_proxyfe_release,
++
++	.init = dvb_proxyfe_init,
++	.sleep = dvb_proxyfe_sleep,
++
++	.set_frontend = dvb_proxyfe_set_frontend,
++	.get_frontend = dvb_proxyfe_get_frontend,
++
++	.read_status = dvb_proxyfe_read_status,
++	.read_ber = dvb_proxyfe_read_ber,
++	.read_signal_strength = dvb_proxyfe_read_signal_strength,
++	.read_snr = dvb_proxyfe_read_snr,
++	.read_ucblocks = dvb_proxyfe_read_ucblocks,
++};
++
++static struct dvb_frontend_ops dvb_proxyfe_qam_ops = {
++	.delsys = { SYS_DVBC_ANNEX_A },
++	.info = {
++		.name			= "vTuner proxyFE DVB-C",
++		.type			= FE_QAM,
++		.frequency_stepsize	= 62500,
++		.frequency_min		= 51000000,
++		.frequency_max		= 858000000,
++		.symbol_rate_min	= (57840000/2)/64,     /* SACLK/64 == (XIN/2)/64 */
++		.symbol_rate_max	= (57840000/2)/4,      /* SACLK/4 */
++		.caps = FE_CAN_QAM_16 | FE_CAN_QAM_32 | FE_CAN_QAM_64 |
++			FE_CAN_QAM_128 | FE_CAN_QAM_256 |
++			FE_CAN_FEC_AUTO | FE_CAN_INVERSION_AUTO
++	},
++
++	.release = dvb_proxyfe_release,
++
++	.init = dvb_proxyfe_init,
++	.sleep = dvb_proxyfe_sleep,
++
++	.set_frontend = dvb_proxyfe_set_frontend,
++	.get_frontend = dvb_proxyfe_get_frontend,
++
++	.read_status = dvb_proxyfe_read_status,
++	.read_ber = dvb_proxyfe_read_ber,
++	.read_signal_strength = dvb_proxyfe_read_signal_strength,
++	.read_snr = dvb_proxyfe_read_snr,
++	.read_ucblocks = dvb_proxyfe_read_ucblocks,
++};
++
++static struct dvb_frontend_ops dvb_proxyfe_qpsk_ops = {
++	.delsys = { SYS_DVBS },
++	.info = {
++		.name			= "vTuner proxyFE DVB-S",
++		.type			= FE_QPSK,
++		.frequency_min		= 950000,
++		.frequency_max		= 2150000,
++		.frequency_stepsize	= 250,           /* kHz for QPSK frontends */
++		.frequency_tolerance	= 29500,
++		.symbol_rate_min	= 1000000,
++		.symbol_rate_max	= 45000000,
++		.caps = FE_CAN_INVERSION_AUTO |
++			FE_CAN_FEC_1_2 | FE_CAN_FEC_2_3 | FE_CAN_FEC_3_4 |
++			FE_CAN_FEC_5_6 | FE_CAN_FEC_7_8 | FE_CAN_FEC_AUTO |
++			FE_CAN_QPSK
++	},
++
++	.release = dvb_proxyfe_release,
++
++	.init = dvb_proxyfe_init,
++	.sleep = dvb_proxyfe_sleep,
++
++	.get_frontend = dvb_proxyfe_get_frontend,
++	.get_property = dvb_proxyfe_get_property,
++	.get_frontend_algo = dvb_proxyfe_get_frontend_algo,
++	.set_frontend = dvb_proxyfe_set_frontend,
++
++	.read_status = dvb_proxyfe_read_status,
++	.read_ber = dvb_proxyfe_read_ber,
++	.read_signal_strength = dvb_proxyfe_read_signal_strength,
++	.read_snr = dvb_proxyfe_read_snr,
++	.read_ucblocks = dvb_proxyfe_read_ucblocks,
++
++	.set_voltage = dvb_proxyfe_set_voltage,
++	.set_tone = dvb_proxyfe_set_tone,
++
++	.diseqc_send_master_cmd         = dvb_proxyfe_send_diseqc_msg,
++	.diseqc_send_burst              = dvb_proxyfe_send_diseqc_burst,
++
++};
++
++int /*__devinit*/ vtunerc_frontend_init(struct vtunerc_ctx *ctx, int vtype)
++{
++	int ret = 0;
++
++	if (ctx->fe && vtype == ctx->vtype) {
++		printk(KERN_NOTICE "vtunerc%d: frontend already initialized as type=%d\n",
++				ctx->idx, ctx->vtype);
++		return 0;
++	}
++
++	switch (vtype) {
++	case VT_S:
++		ctx->fe = dvb_proxyfe_qpsk_attach(ctx, 0);
++		break;
++	case VT_S2:
++		ctx->fe = dvb_proxyfe_qpsk_attach(ctx, 1);
++		break;
++	case VT_T:
++		ctx->fe = dvb_proxyfe_ofdm_attach(ctx);
++		break;
++	case VT_C:
++		ctx->fe = dvb_proxyfe_qam_attach(ctx);
++		break;
++	default:
++		printk(KERN_ERR "vtunerc%d: unregognized tuner vtype = %d\n",
++				ctx->idx, ctx->vtype);
++		return -EINVAL;
++	}
++
++	if(ctx->vtype == VT_NULL) // means: was frontend not registered yet?
++		ret = dvb_register_frontend(&ctx->dvb_adapter, ctx->fe);
++
++	ctx->vtype = vtype;
++
++	return ret;
++}
++
++int /*__devinit*/ vtunerc_frontend_clear(struct vtunerc_ctx *ctx)
++{
++	return ctx->fe ? dvb_unregister_frontend(ctx->fe) : 0;
++}
+diff -ruN a/drivers/media/vtuner/vtuner.h b/drivers/media/vtuner/vtuner.h
+--- a/drivers/media/vtuner/vtuner.h	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/media/vtuner/vtuner.h	2017-04-01 07:22:59.840545188 +0100
+@@ -0,0 +1,114 @@
++/*
++ * vtunerc: /dev/vtunerc API
++ *
++ * Copyright (C) 2010-11 Honza Petrous <jpetrous@smartimp.cz>
++ * [based on dreamtuner userland code by Roland Mieslinger]
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef _VTUNER_H_
++#define _VTUNER_H_
++
++#include <linux/dvb/version.h>
++#include <linux/dvb/frontend.h>
++#include <linux/dvb/dmx.h>
++
++#define VT_NULL 0x00
++#define VT_S   0x01
++#define VT_C   0x02
++#define VT_T   0x04
++#define VT_S2  0x08
++
++#define MSG_SET_FRONTEND		1
++#define MSG_GET_FRONTEND		2
++#define MSG_READ_STATUS			3
++#define MSG_READ_BER			4
++#define MSG_READ_SIGNAL_STRENGTH	5
++#define MSG_READ_SNR			6
++#define MSG_READ_UCBLOCKS		7
++#define MSG_SET_TONE			8
++#define MSG_SET_VOLTAGE			9
++#define MSG_ENABLE_HIGH_VOLTAGE		10
++#define MSG_SEND_DISEQC_MSG		11
++#define MSG_SEND_DISEQC_BURST		13
++#define MSG_PIDLIST			14
++#define MSG_TYPE_CHANGED		15
++#define MSG_SET_PROPERTY		16
++#define MSG_GET_PROPERTY		17
++
++#define MSG_NULL			1024
++#define MSG_DISCOVER			1025
++#define MSG_UPDATE       		1026
++
++struct diseqc_master_cmd {
++	u8 msg[6];
++	u8 msg_len;
++};
++
++struct vtuner_message {
++	s32 type;
++	union {
++		struct {
++			u32	frequency;
++			u8	inversion;
++			union {
++				struct {
++					u32	symbol_rate;
++					u32	fec_inner;
++				} qpsk;
++				struct {
++					u32   symbol_rate;
++					u32   fec_inner;
++					u32	modulation;
++				} qam;
++				struct {
++					u32	bandwidth;
++					u32	code_rate_HP;
++					u32	code_rate_LP;
++					u32	constellation;
++					u32	transmission_mode;
++					u32	guard_interval;
++					u32	hierarchy_information;
++				} ofdm;
++				struct {
++					u32	modulation;
++				} vsb;
++			} u;
++		} fe_params;
++		struct dtv_property prop;
++		u32 status;
++		u32 ber;
++		u16 ss;
++		u16 snr;
++		u32 ucb;
++		u8 tone;
++		u8 voltage;
++		struct diseqc_master_cmd diseqc_master_cmd;
++		u8 burst;
++		u16 pidlist[30];
++		u8  pad[72];
++		u32 type_changed;
++	} body;
++};
++
++#define VTUNER_MAJOR		226
++
++/*#define PVR_FLUSH_BUFFER	_IO(VTUNER_MAJOR, 0)*/
++#define VTUNER_GET_MESSAGE	_IOR(VTUNER_MAJOR, 1, struct vtuner_message *)
++#define VTUNER_SET_RESPONSE 	_IOW(VTUNER_MAJOR, 2, struct vtuner_message *)
++#define VTUNER_SET_NAME		_IOW(VTUNER_MAJOR, 3, char *)
++#define VTUNER_SET_TYPE		_IOW(VTUNER_MAJOR, 4, char *)
++#define VTUNER_SET_FE_INFO	_IOW(VTUNER_MAJOR, 6, struct dvb_frontend_info *)
++#define VTUNER_SET_NUM_MODES	_IOW(VTUNER_MAJOR, 7, int)
++#define VTUNER_SET_MODES	_IOW(VTUNER_MAJOR, 8, char *)
++
++#endif
++

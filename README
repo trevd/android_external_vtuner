@@ -1,0 +1,35 @@
+vtuner for Android
+
+vtunerd - 	Server Application to be run on the host
+			the machine the DVB tuner is connected to 
+			
+vtunerc - 	Client Application to be run on the machine you want to use 
+			the tuner on
+			
+vtuner.patch vtuner-kernel-4.9.patch - patch to add the kernel driver
+
+
+Example How to:
+Server - Standard Linux Desktop with USB Tuner connected
+Client - Android HiKey Master Branch Builld
+
+build the kernel driver for the HiKey kernel
+
+Start the Server
+sudo -E $ANDROID_HOST_OUT/bin/vtunerd
+
+Start the Client
+adb shell vtunerc -fS2
+
+Set permissions for vlc access
+adb shell chmod 666 /dev/vtunerc0
+adb shell "chmod 666 /dev/dvb0*"
+
+Use szap-s2 to tuner channel
+adb shell -x "szap-s2  -p \"Channel 4\""
+
+View with VLC Player
+adb shell am start -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity "file:///dev/dvb0.dvr0"
+
+
+
