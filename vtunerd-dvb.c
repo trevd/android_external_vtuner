@@ -7,8 +7,7 @@
 #include <poll.h>
 #include <cutils/log.h>
 
-#include "vtuner-dvb-3.h"
-#include "vtuner-utils.h"
+#include "vtunerd.h"
 
 int hw_init(vtuner_hw_t* hw, int adapter, int frontend, int demux, int dvr) {
 
@@ -245,10 +244,6 @@ int hw_get_property(vtuner_hw_t* hw, struct dtv_property* prop) {
 
 int hw_set_property(vtuner_hw_t* hw, struct dtv_property* prop) {
   int ret=0;
-#if DVB_API_VERSION < 5
-  ret = -1;
-  ALOGW( "FE_SET_PROPERTY is not available\n");
-#else
   ALOGD("FE_SET_PROPERTY %d\n", prop->cmd);
   switch( prop->cmd ) {
     case DTV_UNDEFINED: break;
@@ -296,7 +291,6 @@ int hw_set_property(vtuner_hw_t* hw, struct dtv_property* prop) {
       ALOGW( "FE_SET_PROPERTY unknown property %d\n", prop->cmd);
       ret = -1;
   }
-#endif
   return ret;
 }
 

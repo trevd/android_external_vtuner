@@ -19,18 +19,7 @@
 #include <sys/param.h>
 #include <pthread.h>
 
-
 #include "vtuner-network.h"
-
-#define MSG_ERROR	1
-#define MSG_WARN	2
-#define MSG_INFO	3
-#define MSG_DEBUG	4
-
-
-#ifndef BUILDVER
-#define BUILDVER 0
-#endif
 
 #define TS_PKT_LEN 188
 #define TS_HDR_SYNC 0x47
@@ -398,7 +387,7 @@ int main(int argc, char **argv) {
       break;
     }
 
- fprintf(stderr, "Revision:%s%s DVB:%d.%d allow:%d.x NetProto:%d MsgSize:%d, Debug:%d\n", BUILDVER, MODFLAG, DVB_API_VERSION, DVB_API_VERSION_MINOR, HAVE_DVB_API_VERSION, VTUNER_PROTO_MAX, sizeof(vtuner_net_message_t), dbg_level);
+ fprintf(stderr, "DVB:%d.%d NetProto:%d MsgSize:%d, Debug:%d\n", DVB_API_VERSION, DVB_API_VERSION_MINOR, VTUNER_PROTO_MAX, sizeof(vtuner_net_message_t), dbg_level);
 
   // do real option parsing now
   optind = 1; // reset getopt()

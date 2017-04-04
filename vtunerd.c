@@ -8,12 +8,8 @@
 #include <pthread.h>
 #include <linux/dvb/version.h>
 
-#include "vtunerd-service.h"
-#include "vtuner-utils.h"
+#include "vtunerd.h"
 
-#ifndef BUILDVER
-#define BUILDVER 0
-#endif
 
 int dbg_level  = MSG_INFO;
 int use_syslog = 1;
@@ -67,7 +63,7 @@ int main(int argc, char **argv) {
 			break;
 		}
 
-	fprintf(stderr, "Revision:%s%s DVB:%d.%d allow:%d.x NetProto:%d MsgSize:%d, Debug:0x%x\n", BUILDVER, MODFLAG, DVB_API_VERSION, DVB_API_VERSION_MINOR, HAVE_DVB_API_VERSION, VTUNER_PROTO_MAX, sizeof(vtuner_net_message_t), dbg_level);
+	fprintf(stderr, "DVB:%d.%d NetProto:%d MsgSize:%d, Debug:0x%x\n", DVB_API_VERSION, DVB_API_VERSION_MINOR, VTUNER_PROTO_MAX, sizeof(vtuner_net_message_t), dbg_level);
 
 	for(i=0; i<MAX_SESSIONS; ++i) session[i].status = SST_IDLE;
 
@@ -142,12 +138,6 @@ int main(int argc, char **argv) {
 		session[0].dvr = 0;
 		hw_count = 1;
 	}
-
-	#if DVB_API_VERSION >= 5
-		ALOGI("S2API tuning support");
-	#endif
-
-	//udplog_enable(1);
 
 	for(i=0;i<hw_count;++i) {
 		vtuner_hw_t hw;

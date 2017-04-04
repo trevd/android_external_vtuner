@@ -1,17 +1,11 @@
 #define LOG_TAG "vtuner-network"
 #include <cutils/log.h>
-#include "vtuner-utils.h"
 #include "vtuner-network.h"
 #include <string.h>
 #include <stdio.h>
 
 #define NTOHB(host,net,field) host->field=net.field
-//#define NTOHS(host,net,field) host->field=ntohs(net.field)
-//#//define NTOHL(host,net,field) host->field=ntohl(net.field)
-
 #define HTONB(net, host, field) net.field=host->field
-//#define HTONS(net, host, field) net.field=htons(host->field);
-//#define HTONL(net, host, field) net.field=htonl(host->field);
 
 #define HTONLc(net,field) net.field=htonl(net.field)
 #define HTONSc(net,field) net.field=htons(net.field)

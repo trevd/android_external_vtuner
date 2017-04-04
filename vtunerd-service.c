@@ -13,8 +13,7 @@
 #include <pthread.h>
 #include <cutils/log.h>
 
-#include "vtunerd-service.h"
-#include "vtuner-utils.h"
+#include "vtunerd.h"
 
 #define xstr(s) str(s)
 #define str(s) #s

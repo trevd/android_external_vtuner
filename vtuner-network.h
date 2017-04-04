@@ -9,6 +9,10 @@
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
 
+#define MSG_ERROR	1
+#define MSG_WARN	2
+#define MSG_INFO	3
+#define MSG_DEBUG	4
 
 #define VTUNER_DISCOVER_PORT 0x9989
 
@@ -49,45 +53,6 @@ typedef struct diseqc_master_cmd {
 	__u8 msg [6];
 	__u8 msg_len;
 } diseqc_master_cmd_t;
-
-#if DVB_API_VERSION < 5 
-struct dtv_property {
-        __u32 cmd;
-        __u32 reserved[3];
-        union {
-                __u32 data;
-                struct {
-                        __u8 data[32];
-                        __u32 len;
-                        __u32 reserved1[3];
-                        void *reserved2;
-                } buffer;
-        } u;
-        int result;
-} __attribute__ ((packed));
-
-#define DTV_UNDEFINED           0
-#define DTV_TUNE                1
-#define DTV_CLEAR               2
-#define DTV_FREQUENCY           3
-#define DTV_MODULATION          4
-#define DTV_BANDWIDTH_HZ        5
-#define DTV_INVERSION           6
-#define DTV_DISEQC_MASTER       7
-#define DTV_SYMBOL_RATE         8
-#define DTV_INNER_FEC           9
-#define DTV_VOLTAGE             10
-#define DTV_TONE                11
-#define DTV_PILOT               12
-#define DTV_ROLLOFF             13
-#define DTV_DISEQC_SLAVE_REPLY  14
-#define DTV_FE_CAPABILITY_COUNT	15
-#define DTV_FE_CAPABILITY	16
-#define DTV_DELIVERY_SYSTEM	17
-
-#define DTV_IOCTL_MAX_MSGS 64
-
-#endif
 
 typedef struct vtuner_message {
         __s32 type;
@@ -134,22 +99,6 @@ typedef struct vtuner_message {
         } body;
 } vtuner_message_t;
 
-/*
-typedef struct vtuner_frontend_info {
-  char name[128];
-  vtuner_type_t type;
-  __u32 frequency_min;
-  __u32 frequency_max;
-  __u32 frequency_stepsize;
-  __u32 frequency_tolerance;
-  __u32 symbol_rate_min;
-  __u32 symbol_rate_max;
-  __u32 symbol_rate_tolerance; 
-  __u32 notifier_delay;
-  __u8 caps;
-} vtuner_frontend_info_t;
-*/
-
 typedef struct vtuner_discover {
 //  vtuner_frontend_info_t fe_info;   
   vtuner_type_t vtype;
@@ -178,8 +127,8 @@ typedef struct vtuner_net_message {
   } u;
 } vtuner_net_message_t;
 
-  void get_dvb_frontend_parameters( struct dvb_frontend_parameters*, vtuner_message_t*, vtuner_type_t); 
-  void set_dvb_frontend_parameters( vtuner_message_t*, struct dvb_frontend_parameters*, vtuner_type_t);
+void get_dvb_frontend_parameters( struct dvb_frontend_parameters*, vtuner_message_t*, vtuner_type_t);
+void set_dvb_frontend_parameters( vtuner_message_t*, struct dvb_frontend_parameters*, vtuner_type_t);
 
 int ntoh_get_message_type( vtuner_net_message_t*);
 void hton_vtuner_net_message( vtuner_net_message_t*, vtuner_type_t);
