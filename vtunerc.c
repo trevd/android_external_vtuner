@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
       if(!stat(optarg, &st) && S_ISCHR(st.st_mode))
         ctrl_devname = optarg;
       else {
-         fprintf(stderr,"can't open control device: %s", optarg);
+         fprintf(stderr,"can't open control device: %s\n", optarg);
         exit(1);
       }
       ctrl_idx = ctrl_devname[strlen(ctrl_devname) - 1] - '0'; //FIXME: it works "only" for first ten devices
@@ -450,7 +450,7 @@ int main(int argc, char **argv) {
           vtuner_info[modes] = &fe_info_dvbt;
           strncpy(ctypes[modes],"DVB-T",sizeof(ctypes[0]));
         } else {
-           fprintf(stderr,"unknown tuner mode specified: %s allowed values are: -s -S -s2 -S2 -c -t (with optional group mask)", optarg);
+           fprintf(stderr,"unknown tuner mode specified: %s allowed values are: -s -S -s2 -S2 -c -t (with optional group mask)\n", optarg);
           exit(1);
         }
 
@@ -463,15 +463,13 @@ int main(int argc, char **argv) {
 	act = nxt;
 	if(nxt)
 	  act++;
-        fprintf(stderr,"added frontend mode %s as mode %d, searching for tuner types %x", ctypes[modes], modes, types[modes]);
+        fprintf(stderr,"added frontend mode %s as mode %d, searching for tuner types %x\n", ctypes[modes], modes, types[modes]);
         modes++;
-#ifndef HAVE_DREAMBOX_HARDWARE
 	if(modes > 0) {
 	  if(modes > 1)
             ALOGW("frontend switch: only one mode is allowed. First is used");
 	  break; // only one mode is allowed for opensourced vtunerc.ko
 	}
-#endif
       } while (act);
       break;
 
@@ -506,11 +504,7 @@ int main(int argc, char **argv) {
     case 'h': // help
       fprintf(stderr, "Command line options:\n"
                       "  Required:\n"
-#ifdef HAVE_DREAMBOX_HARDWARE
-                      "    -f dvb_type[:tuner_mask][,<dvb_type_2>[:tuner_mask_2][,dvb_type_3[:tuner_mask_3]]] : tuner type to ask (dvb_type=S,s,S2,s2,T,C) and optional tuner group mask (every bit represents one tuner group)\n"
-#else
                       "    -f dvb_type[:tuner_mask] : tuner type to ask (dvb_type=S,S2,T,C) and optional tuner group mask (every bit represents one tuner group)\n"
-#endif
                       "  Optional:\n"
                       "    -d dev_name              : path to controlling device (usually /dev/vtunerc0)\n"
                       "    -n hostname[:port]       : do direct request for tuner (multicast by default)\n"
@@ -523,7 +517,7 @@ int main(int argc, char **argv) {
   }
 
   if(modes == 0) {
-    fprintf(stderr,"Missing required -f parameter");
+    fprintf(stderr,"Missing required -f parameter\n");
     exit(1);
   }
 
@@ -558,25 +552,6 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
-#ifdef HAVE_DREAMBOX_HARDWARE
-  if (ioctl(vtuner_control, VTUNER_SET_HAS_OUTPUTS, "no")) {
-    ALOGI("VTUNER_SET_HAS_OUTPUTS failed - %m");
-    exit(1);
-  }
-
-  int f;
-  f = open("/proc/stb/info/model",O_RDONLY);
-  if(f>0) {
-
-    char model[20];
-    int len;
-    len = read(f, &model, sizeof(model)-1); 
-    close(f);
-    model[len] = 0;
-    ALOGI("Box is a %s", model);
-  }
-#endif
-
   discover_worker_data_t dsd;
   dsd.status = DWS_IDLE;
   dsd.direct_ip = strlen(direct_ip) ? strdup(direct_ip) : NULL;
@@ -600,28 +575,10 @@ int main(int argc, char **argv) {
       ALOGI("no server connected. discover thread is %d (DWS_IDLE:%d, DWS_RUNNING:%d)", dsd.status, DWS_IDLE, DWS_RUNNING);
       if( dsd.status == DWS_IDLE ) {
         ALOGI("changing frontend mode to %s", ctypes[mode]);
-#ifndef HAVE_DREAMBOX_HARDWARE
         if (ioctl(vtuner_control, VTUNER_SET_TYPE, ctypes[0])) {
           ALOGI("VTUNER_SET_TYPE failed - %m");
           exit(1);
         }
-#else
-	if( modes == 1 ) {
-          if (ioctl(vtuner_control, VTUNER_SET_TYPE, ctypes[0])) {
-            ALOGI("VTUNER_SET_TYPE failed - %m");
-            exit(1);
-          }
-	} else {
-          if( ioctl(vtuner_control, VTUNER_SET_NUM_MODES, modes) ) {
-            ALOGI("VTUNER_SET_NUM_MODES( %d ) failed - %m", modes);
-            exit(1);
-          }
-          if( ioctl(vtuner_control, VTUNER_SET_MODES, ctypes) ) {
-            ALOGI(" VTUNER_SET_MODES failed( %s, %s, %s ) - %m", ctypes[0], ctypes[1], ctypes[2]);
-            exit(1);
-          }
-	}
-#endif
 
         if (ioctl(vtuner_control, VTUNER_SET_FE_INFO, vtuner_info[mode])) {
           ALOGI("VTUNER_SET_FE_INFO failed - %m");
